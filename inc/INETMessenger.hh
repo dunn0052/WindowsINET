@@ -33,6 +33,8 @@ constexpr unsigned int _SERVER_VERSION = 2;
 #include "Logger.hh"
 #include "MessageTypes.hh"
 
+#include "../wepoll/wepoll.h"
+
 #include <vector>
 #include <string>
 #include <sys/types.h>
@@ -377,7 +379,10 @@ public:
         PROFILE_FUNCTION();
         RETCODE retcode = RTN_OK;
         int num_poll_events = 0;
-        INT timeout = 10; /* in milliseconds */
+        INT timeout = 100; /* in milliseconds */
+
+        int maxevents = 64; /* max number of updates */
+        struct epoll_event events[64];
 
         while (StopRequested() == false)
         {
@@ -387,20 +392,16 @@ public:
                 LOG_WARN("Could not handle sends");
             }
 
+#if 0
             retcode = HandleAccepts();
             if (RTN_OK != retcode)
             {
                 LOG_WARN("Failed to handle accepts");
             }
+#endif
 
-            if (m_PollFDVector.empty())
-            {
-                /* No connections so just continue */
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
-            }
+            num_poll_events = epoll_wait(m_PollSocket, events, maxevents, timeout);
 
-            num_poll_events = WSAPoll(&m_PollFDVector[0], static_cast<ULONG>(m_PollFDVector.size()), timeout);
 
             if (0 == num_poll_events)
             {
@@ -415,21 +416,32 @@ public:
                 break;
             }
 
-            for (WSAPOLLFD& poll : m_PollFDVector )
+            for (size_t event_index = 0;
+                event_index < num_poll_events;
+                event_index++)
             {
+                int fd = events[event_index].data.fd;
+
+                if (m_ListeningSocket == fd)
+                {
+                    /*
+                    * A new client is connecting to us
+                    */
+                    if (RTN_OK != AcceptNewClient())
+                    {
+                        LOG_WARN("Failed to accept client socket: ", fd);
+                    }
+                    continue;
+                }
+
                 /*
                 * We have event(s) from client so read what they have to say
                 */
-                CONNECTION& connection = m_FDMap[poll.fd];
-                retcode = HandleEvent(connection, poll);
-
-                if (RTN_CONNECTION_FAIL == retcode)
-                {
-                    // Send signal that it's not available for sending??
-                }
+                CONNECTION connection = m_FDMap[fd];
+                retcode =
+                    HandleEvent(connection, fd, events[event_index].events);
 
             }
-
             /* @TODO: change the sleep value to config so user can
                 * determine how often to check for messages
                 */
@@ -441,22 +453,20 @@ public:
     }
 
     PollThread(const std::string& portNumber = "") :
-        m_Ready(false), m_PollFDVector(),
+        m_Ready(false),
         m_ListeningSocket(INVALID_SOCKET),
-        m_AcceptPollSocket(),
+        m_PollSocket(nullptr),
         m_Port(portNumber), m_Address(),
         m_SendQueue(), m_ReceiveQueue()
     {
         PROFILE_FUNCTION();
 
         RETCODE retcode = LoadWinsockLibrary();
-
         if (RTN_OK != retcode)
         {
             LOG_FATAL("Could not load Winsock library");
             return;
         }
-
 
         retcode = SetupListeningSocket();
         if (RTN_OK != retcode)
@@ -465,7 +475,33 @@ public:
             return;
         }
 
+        retcode = InitPoll();
+
+        retcode = AddFDToPoll(m_ListeningSocket, EPOLLIN | EPOLLPRI);
+        if (RTN_OK != retcode)
+        {
+            LOG_FATAL("Could not add listening socket to poll");
+            return;
+        }
+
         m_Ready = true; // Nothing else can happen unles this is set
+    }
+
+    RETCODE InitPoll()
+    {
+        PROFILE_FUNCTION();
+        int err;
+
+        /* The epoll_create argument is ignored on modern Linux */
+        m_PollSocket = epoll_create(255);
+        if (nullptr == m_PollSocket)
+        {
+            err = errno;
+            //LOG_FATAL("Error creating epoll: ", strerror_s();
+            return RTN_FAIL;
+        }
+
+        return RTN_OK;
     }
 
     RETCODE StartPoll(void)
@@ -518,9 +554,8 @@ public:
         SS_PORT((SOCKADDR*)&addrLoopback) = htons(PortStringToInt(m_Port));
 
         /* Create listening socket */
-        SOCKET& listeningSocket = m_AcceptPollSocket.fd;
-        listeningSocket = socket(AF_INET, SOCK_STREAM, 0);
-        if (INVALID_SOCKET == listeningSocket)
+        m_ListeningSocket = socket(AF_INET, SOCK_STREAM, 0);
+        if (INVALID_SOCKET == m_ListeningSocket)
         {
             LOG_FATAL("Could not create listening socket: ", WSAGetLastError());
             retcode |= CleanupWinsockLibrary();
@@ -528,61 +563,111 @@ public:
         }
 
         /* Set non-block */
-        if (SOCKET_ERROR == ioctlsocket(listeningSocket, FIONBIO, &sockOptionFlag))
+        if (SOCKET_ERROR == ioctlsocket(m_ListeningSocket, FIONBIO, &sockOptionFlag))
         {
             LOG_FATAL("Could not set listening socket option: ", WSAGetLastError());
-            closesocket(listeningSocket);
+            closesocket(m_ListeningSocket);
             retcode |= CleanupWinsockLibrary();
             retcode |= RTN_CONNECTION_FAIL;
             return retcode;
         }
 
         /* Set bind for listening socket */
-        if (SOCKET_ERROR == bind(listeningSocket, (SOCKADDR*)&addrLoopback, sizeof(addrLoopback)))
+        if (SOCKET_ERROR == bind(m_ListeningSocket, (SOCKADDR*)&addrLoopback, sizeof(addrLoopback)))
         {
             LOG_FATAL("Could not bind listening socket: ", WSAGetLastError());
-            closesocket(listeningSocket);
+            closesocket(m_ListeningSocket);
             retcode |= CleanupWinsockLibrary();
             retcode |= RTN_CONNECTION_FAIL;
             return retcode;
         }
 
         /* Start listening for connections */
-        if (SOCKET_ERROR == listen(listeningSocket, SOMAXCONN))
+        if (SOCKET_ERROR == listen(m_ListeningSocket, SOMAXCONN))
         {
-            LOG_FATAL("Winsock error: ", WSAGetLastError(), "Failed to start listening on socket : ", listeningSocket);
-            closesocket(listeningSocket);
+            LOG_FATAL("Winsock error: ", WSAGetLastError(), "Failed to start listening on socket : ", m_ListeningSocket);
+            closesocket(m_ListeningSocket);
             retcode |= CleanupWinsockLibrary();
             retcode |= RTN_CONNECTION_FAIL;
             return retcode;
         }
 
-        m_AcceptPollSocket.events = POLLRDNORM;
-
         return retcode;
     }
 
-    RETCODE HandleAccepts(void)
+    /* Accept connects and require a handshake */
+    RETCODE AcceptNewClient()
     {
-        int num_accepts = WSAPoll(&m_AcceptPollSocket, 1, 5);
+        PROFILE_FUNCTION();
+        RETCODE retcode = RTN_OK;
+        struct sockaddr incoming_accepted_address;
+        socklen_t incoming_address_size = sizeof(incoming_accepted_address);
+        SOCKET accept_socket = INVALID_SOCKET;
+        char accepted_address[INET6_ADDRSTRLEN];
+        int err = 0;
+        ULONG sockOptionFlag = 1;
 
-        if (0 == num_accepts)
+        CONNECTION connection;
+        ACKNOWLEDGE acknowledge = { 0 };
+
+        accept_socket = accept(m_ListeningSocket,
+            (struct sockaddr*)&incoming_accepted_address,
+            &incoming_address_size);
+
+        if (0 < accept_socket)
         {
-            return RTN_OK;
+            inet_ntop(incoming_accepted_address.sa_family,
+                get_in_addr((struct sockaddr*)&incoming_accepted_address),
+                accepted_address, sizeof(accepted_address));
+
+            // Wait for client to send ack
+            retcode = ReceiveAck(accept_socket);
+
+            if (RTN_OK == retcode)
+            {
+                memcpy(connection.address, accepted_address, sizeof(connection.address));
+                connection.port = PortStringToInt(m_Port);
+
+                // Non-block set for smooth receives and sends
+                if (SOCKET_ERROR == ioctlsocket(accept_socket, FIONBIO, &sockOptionFlag))
+                {
+                    LOG_FATAL("Could not set listening socket option: ", WSAGetLastError());
+                    closesocket(accept_socket);
+                    retcode |= CleanupWinsockLibrary();
+                    retcode |= RTN_CONNECTION_FAIL;
+                    return retcode;
+                }
+
+                if (RTN_OK != AddConnection(accept_socket, connection, EPOLLIN | EPOLLPRI))
+                {
+                    LOG_WARN("Bad connection: ", accepted_address);
+                    closesocket(accept_socket);
+                    return RTN_FAIL;
+                }
+
+                return RTN_OK;
+            }
+            else
+            {
+                LOG_WARN("Failed to accept client: ", accepted_address);
+                closesocket(accept_socket);
+                return RTN_CONNECTION_FAIL;
+            }
+        }
+        else
+        {
+            err = errno;
+            if (err == EAGAIN)
+            {
+                /* Socket busy so we just try again next time around */
+                return RTN_OK;
+            }
+
+            /* Error */
+            //LOG_ERROR("Error in accept(): ", strerror(err));
+            return RTN_FAIL;
         }
 
-        if (INVALID_SOCKET == num_accepts)
-        {
-            return RTN_CONNECTION_FAIL;
-        }
-
-        if (m_AcceptPollSocket.revents & POLLRDNORM)
-        {
-            return AcceptNewClient();
-        }
-
-        /* Should never be hit */
-        return RTN_OK;
     }
 
     RETCODE GetConnectionForSelf(void)
@@ -790,7 +875,7 @@ public:
 #endif
             memcpy(conn.address, accepted_address, sizeof(conn.address));
             conn.port = PortStringToInt(port);
-            retcode |= AddConnection(connectedSocket, conn);
+            retcode |= AddConnection(connectedSocket, conn, EPOLLIN | EPOLLPRI);
         }
 
         if (RTN_OK != retcode)
@@ -914,6 +999,82 @@ public:
 
     }
 
+    /* Handle both accepts, disconnects, and of course incoming messages */
+    RETCODE HandleEvent(const CONNECTION& connection, SOCKET fd, uint32_t revents)
+    {
+        PROFILE_FUNCTION();
+        RETCODE retcode = RTN_OK;
+        int err;
+        int recv_ret;
+        INET_HEADER inet_header = {};
+        const uint32_t err_mask = EPOLLERR | EPOLLHUP;
+
+        // Need to get connection that matches fd to call disconnect delegate
+        if (revents & err_mask)
+        {
+            retcode = RemoveConnection(fd, connection);
+            return RTN_CONNECTION_FAIL;
+        }
+
+        recv_ret = recv(fd, reinterpret_cast<char*>(&inet_header), sizeof(INET_HEADER), 0);
+        if (recv_ret == 0)
+        {
+            RemoveConnection(fd, connection);
+            return RTN_CONNECTION_FAIL;
+        }
+
+        if (recv_ret < 0)
+        {
+            /* EAGAIN denotes no data to read -- kindly ignore */
+            err = errno;
+            if (err == EAGAIN)
+            {
+                return RTN_OK;
+            }
+
+            /* Error */
+            //LOG_WARN("Error receving data from connection: ", m_FDMap[fd].address, ":", " errorno: ", strerror(errno));
+            RemoveConnection(fd, connection);
+            return RTN_CONNECTION_FAIL;
+        }
+
+        /* Dynamically create memory for whole package size */
+        /* Maybe needs size limiting to avoid giant packages */
+        INET_PACKAGE* package = reinterpret_cast<INET_PACKAGE*>(new char[sizeof(INET_PACKAGE) + inet_header.message_size]);
+        memcpy(&(package->header.connection), &m_FDMap[fd], sizeof(CONNECTION));
+        package->header.message_size = inet_header.message_size;
+        package->header.data_type = inet_header.data_type;
+        size_t remaining_message = package->header.message_size;
+
+        while (0 < (recv_ret = recv(fd, package->payload + inet_header.message_size - remaining_message, static_cast<int>(remaining_message), 0)))
+        {
+            remaining_message -= static_cast<size_t>(recv_ret);
+        }
+
+        if (remaining_message != 0)
+        {
+            err = errno;
+            if (err != EAGAIN)
+            {
+#if 0
+                /* Error */
+                LOG_WARN("Error receving data from connection: ",
+                    package->header.connection.address,
+                    " errono: ",
+                    strerror(errno));
+#endif
+                RemoveConnection(fd, connection);
+                return RTN_CONNECTION_FAIL;
+            }
+
+        }
+
+        m_TotalDataRecv += package->header.message_size;
+        m_OnReceive(package);
+        delete[] package;
+        return RTN_OK;
+    }
+
     /* Pick up messages in the send queue  and send */
     RETCODE HandleSends(void)
     {
@@ -962,84 +1123,64 @@ public:
         return RTN_OK;
     }
 
-    /* Accept connects and require a handshake */
-    RETCODE AcceptNewClient()
+    RETCODE AddFDToPoll(SOCKET fd, uint32_t events)
     {
         PROFILE_FUNCTION();
-        RETCODE retcode = RTN_OK;
-        struct sockaddr incoming_accepted_address;
-        socklen_t incoming_address_size = sizeof(incoming_accepted_address);
-        SOCKET accept_socket = -1;
-        char accepted_address[INET6_ADDRSTRLEN];
-        int err = 0;
+        int err;
+        struct epoll_event event;
 
-        CONNECTION connection;
-        ACKNOWLEDGE acknowledge = { 0 };
+        /* Shut the valgrind up! */
+        memset(&event, 0, sizeof(struct epoll_event));
 
-        accept_socket = accept(m_AcceptPollSocket.fd,
-            (struct sockaddr*)&incoming_accepted_address,
-            &incoming_address_size);
-
-        if (0 < accept_socket)
-        {
-            inet_ntop(incoming_accepted_address.sa_family,
-                get_in_addr((struct sockaddr*)&incoming_accepted_address),
-                accepted_address, sizeof(accepted_address));
-
-            // Wait for client to send ack
-            retcode = ReceiveAck(accept_socket);
-
-            if (RTN_OK == retcode)
-            {
-                memcpy(connection.address, accepted_address, sizeof(connection.address));
-                connection.port = PortStringToInt(m_Port);
-                ULONG nonBockModeSet = 1;
-
-                // Non-block set for smooth receives and sends
-                if (SOCKET_ERROR == ioctlsocket(accept_socket, FIONBIO, &nonBockModeSet))
-                {
-                    LOG_FATAL("Could not set non-block status for accepted socket: ", accept_socket, " with error: ", WSAGetLastError());
-                    return RTN_FAIL;
-                }
-
-                if (RTN_OK != AddConnection(accept_socket, connection))
-                {
-                    LOG_WARN("Bad connection: ", connection);
-                    closesocket(accept_socket);
-                    return RTN_FAIL;
-                }
-
-                return RTN_OK;
-            }
-            else
-            {
-                LOG_WARN("Failed to accept client: ", connection);
-                closesocket(accept_socket);
-                return RTN_CONNECTION_FAIL;
-            }
-        }
-        else
+        event.events = events;
+        event.data.fd = static_cast<int>(fd);
+        if (0 < epoll_ctl(m_PollSocket, EPOLL_CTL_ADD, fd, &event))
         {
             err = errno;
-            if (err == EAGAIN)
-            {
-                /* Socket busy so we just try again next time around */
-                return RTN_OK;
-            }
-
-            /* Error */
-            LOG_FATAL("Error in accept(): ", WSAGetLastError());
+#if 0
+            LOG_ERROR(
+                "Failed to add socket: ",
+                fd,
+                " to polling with error: ",
+                strerror(err));
+#endif
             return RTN_FAIL;
         }
 
+        return RTN_OK;
     }
 
-    /* Add file descriptor to poll so we can listen for events */
-    RETCODE AddFDToPoll(SOCKET fd)
+    RETCODE RemoveFDFromPoll(SOCKET fd)
     {
         PROFILE_FUNCTION();
-        m_PollFDVector.push_back(WSAPOLLFD{ fd, 0, 0 });
-        m_PollFDVector.back().events = POLLIN;
+        int err;
+
+        if (0 > epoll_ctl(m_PollSocket, EPOLL_CTL_DEL, fd, NULL))
+        {
+            err = errno;
+#if 0
+            LOG_ERROR("Failed to remove socket: ",
+                fd,
+                " from polling with error: ",
+                strerror(err));
+#endif
+            return RTN_FAIL;
+        }
+        else
+        {
+            if (closesocket(fd))
+            {
+                err = errno;
+#if 0
+                LOG_ERROR("Failed to close socket: ",
+                    fd,
+                    " from polling with error: ",
+                    strerror(err));
+#endif
+            }
+
+        }
+
         return RTN_OK;
     }
 
@@ -1075,7 +1216,7 @@ public:
         }
 #endif
 
-        RETCODE retcode = AddFDToPoll(fd);
+        RETCODE retcode = AddFDToPoll(fd, EPOLLIN);
 
 
         if (RTN_OK == retcode)
@@ -1085,6 +1226,33 @@ public:
 
             m_OnClientConnect(connection);
         }
+
+        return retcode;
+    }
+
+
+    /* Add connection to both m_FDMap and m_ConnectionMap for 2 way lookup */
+    RETCODE AddConnection(SOCKET fd, const CONNECTION& connection, uint32_t events)
+    {
+
+        /* __INET_BLACKLIST define cuts out all non-local connections */
+#if __INET_BLACKLIST
+        //Blacklist on outside connections -- remove later
+        if (0 != strncmp(connection.address,
+            "192.168.0.",
+            sizeof("192.168.0.") - 1))
+        {
+            close(fd);
+            return RTN_CONNECTION_FAIL;
+        }
+#endif
+
+        RETCODE retcode = AddFDToPoll(fd, events);
+
+        /* Assume fd is unique, right? right?? */
+        m_FDMap[fd] = connection;
+
+        m_OnClientConnect(connection);
 
         return retcode;
     }
@@ -1103,36 +1271,6 @@ public:
         return retcode;
     }
 
-
-    /* Remove file descriptor from poll */
-    RETCODE RemoveFDFromPoll(SOCKET fd)
-    {
-        PROFILE_FUNCTION();
-        size_t pollIndex = 0;
-
-        for (; pollIndex < m_PollFDVector.size(); ++pollIndex)
-        {
-            if (fd == m_PollFDVector.at(pollIndex).fd)
-            {
-                m_PollFDVector.erase(m_PollFDVector.begin() + pollIndex);
-
-                if (closesocket(fd))
-                {
-                    LOG_FATAL("Failed to close socket: ",
-                        fd,
-                        " from polling with error: ",
-                        WSAGetLastError());
-                    return RTN_FAIL;
-                }
-
-                return RTN_OK;
-            }
-        }
-
-        LOG_WARN("Error could not find fd for removal: ", fd);
-        return RTN_NOT_FOUND;
-    }
-
     /* Remove all clients from polling and inovke disconnect for each client */
     RETCODE StopPoll()
     {
@@ -1142,7 +1280,7 @@ public:
         Stop();
 
         for (std::unordered_map<SOCKET, CONNECTION>::iterator iter =
-            m_FDMap.begin(); iter != m_FDMap.end(); ++iter)
+            m_FDMap.begin(); iter != m_FDMap.end(); iter++)
         {
             retcode |= RemoveConnection(iter->first, iter->second);
         }
@@ -1174,10 +1312,8 @@ public:
 
     /* private class members */
     bool m_Ready;
-    std::vector<WSAPOLLFD> m_PollFDVector;
-    ULONG m_PollFDArraySize;
     SOCKET m_ListeningSocket;
-    WSAPOLLFD m_AcceptPollSocket;
+    HANDLE m_PollSocket;
     std::string m_Port;
     std::string m_Address;
     TasQ<INET_PACKAGE*> m_SendQueue;

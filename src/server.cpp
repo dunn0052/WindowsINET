@@ -34,19 +34,25 @@ class WriteThread : public DaemonThread<TasQ<INET_PACKAGE*>*>
 
 };
 
-void endServer(int signal)
+BOOL WINAPI endServer(DWORD signal)
 {
-    LOG_INFO("Received signal: ", signal);
 
-    if (SIGINT == signal)
+    LOG_INFO("Caught signal: ", signal);
+
+    if (CTRL_C_EVENT == signal)
     {
-        g_Running = false;
+        g_Running = FALSE;
     }
+
+    return TRUE;
 }
 
 int main(int argc, char* argv[])
 {
-    signal(SIGINT, endServer);
+    if (!SetConsoleCtrlHandler(endServer, TRUE))
+    {
+        return RTN_FAIL;
+    }
 
     CLI::Parser parse("Listener", "Listen for database updates");
     CLI::CLI_StringArgument connectionAddressArg("-c", "Connection address for Other", false);
