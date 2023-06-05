@@ -19,7 +19,9 @@ class WriteThread : public DaemonThread<TasQ<INET_PACKAGE*>*>
             //std::cin.sync();
             //std::getline(std::cin, user_input);
 
-            std::cin >> user_input;
+            //std::cin >> user_input;
+
+            user_input = "test";
 
             if (!user_input.empty())
             {
@@ -29,6 +31,8 @@ class WriteThread : public DaemonThread<TasQ<INET_PACKAGE*>*>
                 strncpy_s(message->payload, message->header.message_size, user_input.c_str(), user_input.length());
                 messages.Push(message);
             }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
 
@@ -80,7 +84,7 @@ int main(int argc, char* argv[])
         LOG_INFO("Got ", listeningPortArg.GetValue(), " for listeining port number!");
         PollThread messenger(listeningPortArg.GetValue());
 
-        messenger.m_OnStop += [&](int _) { LOG_INFO("Stopped server!"); };
+        messenger.m_OnServerDisconnect += [&](const CONNECTION& connection) { LOG_INFO("Stopped server on: ", connection); };
         messenger.m_OnClientConnect += [&](const CONNECTION& connection) { LOG_INFO("Connected to ", connection.address, ":", connection.port); };
         messenger.m_OnServerConnect += [&](const CONNECTION& connection) { LOG_INFO("Started server on ", connection.address, ":", connection.port); };
         messenger.m_OnDisconnect += [&](const CONNECTION& connection) { LOG_INFO("Client ", connection.address, ":", connection.port, " disconnected"); };
